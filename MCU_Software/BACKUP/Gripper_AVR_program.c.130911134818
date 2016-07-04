@@ -1,0 +1,355 @@
+//----------【硬件配置说明】↓------------------------------------------------------------
+//舵机：波特率19200，电源DC12V，ID：0和1
+//电源线和控制线的电平互不干扰
+//电源2根，RS485两根
+//UART0用于MCU和PC的通信，波特率19200
+//UART1用于MCU和舵机的通信，波特率19200
+
+//----------【头文件】↓------------------------------------------------------------
+#include <iom128v.h>
+#include <macros.h>
+#include <string.h>
+
+//----------【宏定义】↓------------------------------------------------------------
+#define  uchar unsigned char
+#define  uint  unsigned int
+
+#define  mclk   8000000 //时钟频率8.0MHz
+
+//----------【全局变量定义】↓------------------------------------------------------------
+
+uchar no1release[]={0xff,0xff,0x01,0x05,0x03,0x20,0xff,0x07,0xd0};//1号舵机松开（顺时针，力矩100%）
+uchar no1stop[]={0xff,0xff,0x01,0x05,0x03,0x20,0x00,0x00,0xd6}; //1号舵机停止（逆时针，力矩0%）
+
+uchar cage1_state,cage2_state;//表明夹持器两端限位情况
+
+/*以下变量用于建立上位机指令处理机制*/
+uchar uart0_rdata_byte;//UART0每次接收到的单字节信息
+uchar uart0_r_instr_chk=0;//uart0接收到的字符串开头中x字符的个数
+uchar uart0_instr[12];//存储PC发给MCU的指令：前三字节为命令标识，中间八字节命令细节，最后一字节为NULL
+uchar uart0_instr_flag=0;//UART0中断接收到开头和长度符合要求的instr时置为1
+
+uchar MSG[]={'M','S','G',0};
+uchar MSH[]={'M','S','H',0};
+
+//--------------【软件延时函数】--------------------------------------------------------------------
+
+//延时函数，参数为要延时的毫秒数
+void delay(uint ms)
+{
+    uint i,j;
+	for(i=0;i<ms;i++)
+	{
+	 for(j=0;j<1141;j++);
+    }
+}
+
+//----------【UART0的相关函数】↓---------------------------------------------------------------
+
+/*UART0的串口初始化函数*/
+void uart0_init(uint baud)
+{
+   UCSR0B=0x00; 
+   UCSR0A=0x00; 		   //控制寄存器清零
+   UCSR0C=(0<<UPM00)|(3<<UCSZ00); //选择UCSRC，异步模式，禁止校验，1位停止位，8位数据位                       
+   
+   baud=mclk/16/baud-1;    //波特率最大为65K
+   UBRR0L=baud; 					     	  
+   UBRR0H=baud>>8; 		   //设置波特率
+   
+   UCSR0B=(1<<TXEN0)|(1<<RXEN0)|(1<<RXCIE0);   //接收、发送使能，接收中断使能
+   SREG=BIT(7);	           //全局中断开放
+   DDRE|=BIT(1);	           //配置TX为输出（很重要），似乎对于MEGA1280来说没用
+}
+
+/*UART0的串口发送函数，每次发送一个字节（Byte）*/
+void uart0_sendB(uchar data)
+{
+   while(!(UCSR0A&(BIT(UDRE0))));//判断准备就绪否
+   UDR0=data;
+   while(!(UCSR0A&(BIT(TXC0))));//判断完成发送否
+   UCSR0A|=BIT(TXC0);//TXC0标志位手动清零，通过将TXC0置1实现
+}
+
+#pragma interrupt_handler uart0_rx:19
+
+/*UART0的串口接收函数，每次接收一个字节（Byte）*/
+void uart0_rx(void)
+{
+ 	uchar uart0_r_byte;//UART0每次中断接收到的字符（1byte）
+	UCSR0B&=~BIT(RXCIE0);//关闭RXCIE1，其余位保持不变
+	uart0_r_byte=UDR0;
+	if(uart0_instr_make(uart0_r_byte)==0)//通过接受字符串，产生符合要求的instr
+	    {UCSR0B|=BIT(RXCIE0);}//使能RXCIE1，其余位保持不变
+}
+
+/*void uart0_rx(void)
+{	
+    UCSR0B&=~BIT(RXCIE0);
+	uart0_rdata_byte=UDR0;
+	//flag=1;
+	UCSR0B|=BIT(RXCIE0);
+}
+*/
+
+//UART0的指令识别函数，从接收到的字符中提取出以xx开头的指令字符串
+uchar uart0_instr_make(uchar r_byte)
+{
+    uchar instr_num;//instr中已有的字符数
+	uchar fun_ret;//存储本函数返回值 
+    switch(uart0_r_instr_chk)//根据已有x的个数进行操作
+	{
+	    case 0:
+			 {
+			 if(r_byte=='x')
+			     {				 
+				 uart0_r_instr_chk=1;
+				 }
+			 fun_ret=0;
+			 break;
+			 }
+		case 1:
+			 {
+			 if(r_byte=='x')
+			     {uart0_r_instr_chk=2;}
+			 else
+			 	 {uart0_r_instr_chk=0;}
+			 fun_ret=0;
+			 break;
+			 }
+		case 2:
+			 {
+			 instr_num=strlen(uart0_instr);
+			 if(instr_num==10)
+			 {
+			     uart0_instr[instr_num]=r_byte;
+				 uart0_instr_flag=1;//instr已经满足开头xx和长度要求，flag置1，进行命令处理
+			     fun_ret=1;				 
+			 }
+			 else
+			 {
+			     uart0_instr[instr_num]=r_byte;
+				 fun_ret=0;
+			 }
+			 break;
+			 }
+		default:break;
+	}
+	return fun_ret;
+}
+
+/*UART0字符串发送函数*/
+void uart0_send_string(uchar *str_send)//形参：待发送字符串
+{
+ 	 uchar str_send_num=strlen(str_send);//待发送字符串包含的字符数，
+	 	   								//数组str_send最后一位值为NULL
+	 uchar i=0;
+	 while(i<str_send_num)
+	 {
+	   uart0_sendB(*(str_send+i));
+	   i+=1;
+	 }
+}
+//------------【UART1的相关函数】↓-------------------------------------------------------------
+
+/*UART1的串口初始化函数*/
+void uart1_init(uint baud)
+{
+   UCSR1B=0x00; 
+   UCSR1A=0x00; 		   //控制寄存器清零
+   UCSR1C=(0<<UPM10)|(3<<UCSZ10); //选择UCSRC，异步模式，禁止校验，1位停止位，8位数据位                       
+   
+   baud=mclk/16/baud-1;    //波特率最大为65K
+   UBRR1L=baud; 					     	  
+   UBRR1H=baud>>8; 		   //设置波特率
+   
+   UCSR1B=(1<<TXEN1)|(1<<RXEN1)|(1<<RXCIE1);   //接收、发送使能，接收中断使能
+   SREG=BIT(7);	           //全局中断开放
+   DDRD|=BIT(3);	           //配置TX为输出（很重要），似乎对于MEGA1280来说没用
+}
+
+
+/*UART1的串口发送函数，每次发送一个字节（Byte）*/
+void uart1_sendB(uchar data)
+{
+   while(!(UCSR1A&(BIT(UDRE1))));//判断准备就绪否
+   UDR1=data;
+   while(!(UCSR1A&(BIT(TXC1))));//判断完成发送否
+   UCSR1A|=BIT(TXC1);//TXC1标志位手动清零，通过将TXC1置1实现
+}
+
+/*UART1字符串发送函数*/
+void uart1_send_string(uchar *str_send,uchar str_num)//形参：待发送字符串
+{
+	 uchar i=0;
+	 while(i<str_num)
+	 {
+	   uart1_sendB(*(str_send+i));
+	   i+=1;
+	   //delay(10);
+	 }
+}
+
+//#pragma interrupt_handler uart1_rx:31
+
+/*
+void uart1_rx(void)
+{	
+    UCSR1B&=~BIT(RXCIE1);
+	//rdata=UDR1;
+	//flag=1;
+	UCSR1B|=BIT(RXCIE1);
+}
+*/
+
+//------------------【字符串处理函数】↓------------------------------------------------------------------------
+
+//数组元素拷贝函数
+void array_copy(uchar *array1,uchar start_index,uchar *array2,uchar copy_num)
+//将array1中自第start_index位起的copy_num个元素拷贝到array2的第0到copy_num-1位
+//array1的元素数目不应小于start_index+copy_num+1个，array2的元素数目不应小于copy_num个
+{
+    uchar i;
+	for(i=0;i<copy_num;i++)
+	{
+	    array2[i]=array1[start_index+i];
+	}
+}
+
+//字符数组比较函数：若返回0，则表示相等，否则不等
+int array_cmp(char * str0, char * str1)
+{
+    int i;
+    for(i=0;str0[i]!=0 && str1[i]!=0 && str0[i]==str1[i];i++);
+    return str0[i]-str1[i];
+}
+
+//----------------【外部中断向量定义与外部中断处理函数】↓--------------------------------
+
+//限位1（INT5）中断向量定义 //int5-cage1
+#pragma interrupt_handler cage1_interrupt_handler:7
+
+//限位1（INT5）中断处理函数
+void cage1_interrupt_handler(void)
+{
+     uart1_send_string(no1stop,9);//1号舵机停止
+     cage1_state=1;//全局变量
+}
+
+//限位2（INT6）中断向量定义 //int6-cage2
+#pragma interrupt_handler cage2_interrupt_handler:8
+
+//限位2（INT6）中断处理函数
+void cage2_interrupt_handler(void)
+{
+     uart1_send_string(no1stop,9);//1号舵机停止
+     cage2_state=1;//全局变量
+}
+
+//---------------------------【主函数】↓------------------------------------------------------------------
+void main(void)
+{
+    //uchar test_array[]={0xf1,0xf2,0xf3,0xf4,0};
+	//串口通信的配置
+    uart0_init(19200);
+    uart1_init(19200);
+	
+	//RS485芯片设置为发送，DE=PD5=1
+	//注意！该芯片为半双工通信，不可同时收和发，配置引脚时应注意这一点
+	DDRD|=BIT(5);
+    PORTD|=BIT(5);
+
+	DDRD|=BIT(4);
+    PORTD|=BIT(4);
+	
+	delay(500);
+	
+//-----------------------【功能区域分割线】------------------------------------
+	
+	//两端限位的配置
+	
+    //PE5=INT5=限位1，带上拉电阻输入
+    DDRE&=(~BIT(5));
+    PORTE|=BIT(5);
+
+    //PE6=INT6=限位2，带上拉电阻输入
+    DDRE&=(~BIT(6));
+    PORTE|=BIT(6);
+
+    //INT5和INT6的外部中断寄存器配置
+    EICRB|=(0<<ISC51)|(0<<ISC50)|(0<<ISC61)|(0<<ISC60);//中断触发方式：低电平触发
+    EIMSK|=(1<<INT5)|(1<<INT6);//中断使能
+
+    SREG |= 0X80;//打开全局中断
+    
+    //相关变量初始化
+    cage1_state=0;
+    cage2_state=0;
+
+    //命令舵机停止转动
+    uart1_send_string(no1stop,9);
+    delay(50);
+//    uart1_send_string();
+//    delay(50);
+
+    //使手爪松开
+    uart1_send_string(no1release,9);
+//    uart1_send_string();
+
+    //等待两端限位中断的触发
+    while(!(cage1_state & cage2_state));
+    //cage1_state和cage2_state均为True时，跳出while循环
+    
+    uart0_send_string("Get ready! ");//向上位机报告准备就绪
+
+    //恢复全局变量，方便以后使用
+    cage1_state=0;
+    cage2_state=0;
+	
+//-----------------------【功能区域分割线】------------------------------------
+	
+    while(1)
+	{
+	    
+		if(uart0_instr_flag==1)
+		{
+		    uart0_sendB(uart0_rdata_byte);
+			if(array_cmp(uart0_instr,MSG)==0)
+			{
+				uart1_send_string(no1release,9);
+				uart0_send_string(" motor 1 run! ");
+			}
+			
+			if(uart0_rdata_byte=='b')
+			{
+				uart1_send_string(no1stop,9);
+				uart0_send_string(" motor 1 stop! ");
+			}
+			
+			flag=0;
+		}
+		
+		/*
+		uchar i='a';
+		uart1_sendB(i);
+		delay(500);
+		i='b';
+		uart1_sendB(i);
+		delay(500);
+		
+	
+		
+		
+		uart1_send_string(no1release,9);
+		delay(4500);
+		uart1_send_string(no1stop,9);
+		delay(4500);
+				
+		
+		uart1_send_string(no1release);
+		delay(2500);
+		uart1_send_string(no1stop);
+		delay(2500);
+		*/
+	}
+}

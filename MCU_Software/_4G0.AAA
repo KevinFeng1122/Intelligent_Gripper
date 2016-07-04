@@ -1,0 +1,1 @@
+-D__IMAGECRAFT__ -e -D__ICC_VERSION=722 -DATMega128 -MGripper_AVR_program.dp2 -IC:/iccv7avr/include F:\项目\飞行器在轨更换\下位机程序\Gripper_AVR_program.c Gripper_AVR_program.i 

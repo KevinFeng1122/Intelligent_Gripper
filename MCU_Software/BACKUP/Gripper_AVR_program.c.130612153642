@@ -1,0 +1,203 @@
+//波特率19200，电源DC12V，ID：0和1
+//电源线和控制线的电平互不干扰
+//电源2根，RS485两根
+//UART0用于MCU和PC的通信
+//UART1用于MCU和舵机的通信
+
+#include <iom128v.h>
+#include <macros.h>
+#include <string.h>
+
+#define  uchar unsigned char
+#define  uint  unsigned int
+
+#define  mclk   8000000 //时钟频率8.0MHz
+#pragma interrupt_handler uart0_rx:19
+//#pragma interrupt_handler uart1_rx:31
+
+uchar rdata,flag=0;
+uchar no1release[]={0xff,0xff,0x01,0x05,0x03,0x20,0xff,0x07,0xd0,0};//1号舵机松开（顺时针，力矩100%）
+uchar no1stop[]={0xff,0xff,0x01,0x05,0x03,0x20,0x00,0x00,0xd6,0}; //1号舵机停止（逆时针，力矩0%）
+
+//延时函数，参数为要延时的毫秒数
+void delay(uint ms)
+{
+    uint i,j;
+	for(i=0;i<ms;i++)
+	{
+	 for(j=0;j<1141;j++);
+    }
+}
+
+/*UART0的串口初始化函数*/
+void uart0_init(uint baud)
+{
+   UCSR0B=0x00; 
+   UCSR0A=0x00; 		   //控制寄存器清零
+   UCSR0C=(0<<UPM00)|(3<<UCSZ00); //选择UCSRC，异步模式，禁止校验，1位停止位，8位数据位                       
+   
+   baud=mclk/16/baud-1;    //波特率最大为65K
+   UBRR0L=baud; 					     	  
+   UBRR0H=baud>>8; 		   //设置波特率
+   
+   UCSR0B=(1<<TXEN0)|(1<<RXEN0)|(1<<RXCIE0);   //接收、发送使能，接收中断使能
+   SREG=BIT(7);	           //全局中断开放
+   DDRE|=BIT(1);	           //配置TX为输出（很重要），似乎对于MEGA1280来说没用
+   
+}
+
+/*UART1的串口初始化函数*/
+void uart1_init(uint baud)
+{
+   UCSR1B=0x00; 
+   UCSR1A=0x00; 		   //控制寄存器清零
+   UCSR1C=(0<<UPM10)|(3<<UCSZ10); //选择UCSRC，异步模式，禁止校验，1位停止位，8位数据位                       
+   
+   baud=mclk/16/baud-1;    //波特率最大为65K
+   UBRR1L=baud; 					     	  
+   UBRR1H=baud>>8; 		   //设置波特率
+   
+   UCSR1B=(1<<TXEN1)|(1<<RXEN1)|(1<<RXCIE1);   //接收、发送使能，接收中断使能
+   SREG=BIT(7);	           //全局中断开放
+   DDRD|=BIT(3);	           //配置TX为输出（很重要），似乎对于MEGA1280来说没用
+}
+
+/*UART0的串口发送函数，每次发送一个字节（Byte）*/
+void uart0_sendB(uchar data)
+{
+   while(!(UCSR0A&(BIT(UDRE0))));//判断准备就绪否
+   UDR0=data;
+   while(!(UCSR0A&(BIT(TXC0))));//判断完成发送否
+   UCSR0A|=BIT(TXC0);//TXC0标志位手动清零，通过将TXC0置1实现
+}
+
+/*UART1的串口发送函数，每次发送一个字节（Byte）*/
+void uart1_sendB(uchar data)
+{
+   while(!(UCSR1A&(BIT(UDRE1))));//判断准备就绪否
+   UDR1=data;
+   while(!(UCSR1A&(BIT(TXC1))));//判断完成发送否
+   UCSR1A|=BIT(TXC1);//TXC1标志位手动清零，通过将TXC1置1实现
+}
+
+void uart0_rx(void)
+{	
+    UCSR0B&=~BIT(RXCIE0);
+	rdata=UDR0;
+	flag=1;
+	UCSR0B|=BIT(RXCIE0);
+}
+/*
+void uart1_rx(void)
+{	
+    UCSR1B&=~BIT(RXCIE1);
+	//rdata=UDR1;
+	//flag=1;
+	UCSR1B|=BIT(RXCIE1);
+}
+*/
+
+/*UART0的串口接收函数，每次接收一个字节（Byte）
+void uart0_rx(void)
+{
+ 	
+    uchar uart0_r_byte;//UART1每次中断接收到的字符（1byte）
+
+	UCSR0B&=~BIT(RXCIE0);//关闭RXCIE1，其余位保持不变
+	uart0_r_byte=UDR0;
+	if(uart0_instr_make(uart0_r_byte)==0)//通过接受字符串，产生符合要求的instr
+	    {UCSR0B|=BIT(RXCIE0);}//使能RXCIE1，其余位保持不变
+}
+*/
+
+/*UART1的串口接收函数，每次接收一个字节（Byte）
+void uart1_rx(void)
+{
+ 	
+    uchar uart1_r_byte;//UART1每次中断接收到的字符（1byte）
+
+	UCSR1B&=~BIT(RXCIE1);//关闭RXCIE1，其余位保持不变
+	uart1_r_byte=UDR1;
+	if(uart1_instr_make(uart1_r_byte)==0)//通过接受字符串，产生符合要求的instr
+	    {UCSR1B|=BIT(RXCIE1);}//使能RXCIE1，其余位保持不变
+}
+*/
+
+/*UART0字符串发送函数*/
+void uart0_send_string(uchar *str_send)//形参：待发送字符串
+{
+ 	 uchar str_send_num=strlen(str_send);//待发送字符串包含的字符数，
+	 	   								//数组str_send最后一位值为NULL
+	 uchar i=0;
+	 while(i<str_send_num)
+	 {
+	   uart0_sendB(*(str_send+i));
+	   i+=1;
+	 }
+}
+
+/*UART1字符串发送函数*/
+void uart1_send_string(uchar *str_send)//形参：待发送字符串
+{
+ 	 uchar str_send_num=strlen(str_send);//待发送字符串包含的字符数，
+	 	   								//数组str_send最后一位值为NULL
+	 uchar i=0;
+	 while(i<str_send_num)
+	 {
+	   uart1_sendB(*(str_send+i));
+	   i+=1;
+	   delay(50);
+	 }
+	 /* changed
+	 uchar i=0;
+	 for(;i<str_send_num;i++){
+	 uart1_sendB(*(str_send));
+	 str_send+=1;
+	 }
+	 */
+}
+
+void main(void)
+{
+    uart0_init(19200);
+    uart1_init(19200);
+	
+	//DE=PD5=1
+	
+	DDRD|=BIT(5);
+    PORTD|=BIT(5);
+
+	DDRD|=BIT(4);
+    PORTD|=BIT(4);
+	
+	
+    while(1)
+	{
+	      
+		/*if(flag)
+		{
+		    uart0_sendB(rdata);
+			uart0_send_string(no1release);
+		    flag=0;
+			
+			uart1_send_string(no1release);
+			delay(5000);
+			uart1_send_string(no1stop);
+			
+		}
+		*/
+		uchar i='h';
+		uart1_sendB(i);
+		delay(500);
+		
+		uart1_send_string(no1stop);
+		delay(1000);
+		
+		/*
+		uart1_send_string(no1release);
+		delay(2500);
+		uart1_send_string(no1stop);
+		delay(2500);
+		*/
+	}
+}
